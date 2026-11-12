@@ -1,49 +1,123 @@
 # Week 5 assignment — Put a limit on the tunnel
 
-Student ID (last 4 digits only): **NNNN**
+Student ID (last 4 digits only): **1995**
 
 Write each section in your own words, about your own runs. Quote the evidence files in
 `assignment/evidence/` that support each point. Delete the instructions in `<!-- -->` as you go.
 
 ## 1. Analysis: the loop
 
-<!-- How did you create the tunnel loop (which entry, on which switch, which commands)?
-     What did the switch logs show over time, with numbers from loop-before.txt?
-     Then look at the IPv4 path in tunnel.p4: it decrements the TTL. Does that stop an IPv4
-     loop in this program? Check the code, and explain what happens when TTL reaches 0. -->
+I created the tunnel loop by modifying the entry for tunnel destination 3 on
+s2. The entry had handle `0x2` and originally forwarded through port 3. I
+changed its action parameter to port 1 with:
+
+`sh ./p4cli s2 "table_modify MyIngress.myTunnel_exact MyIngress.myTunnel_forward 2 1"`
+
+Switch s1 already forwarded tunnel destination 3 towards s2, while the modified
+s2 entry sent it back towards s1. Therefore, the same packet travelled repeatedly
+between the two switches.
+
+In `evidence/loop-before.txt`, both switches continued processing the packet
+throughout the observation period. The processing counts increased between
+successive measurements, showing that the packet remained in the loop and
+would not stop without intervention.
 
 ## 2. Design: the hop limit
 
-<!-- Your header change and your pipeline change, and the reason for each choice:
-     - the field's size, and where in the header you put it (and why there);
-     - the starting value send.py uses, and how you chose it;
-     - where it's decremented, and what happens when it runs out;
-     - what else had to change for every part of the path to agree (parser, deparser, hosts). -->
+
+The tunnel hop limit as an unsigned 8-bit field placed after
+`dst_id`. The sender starts it at 8. At every switch, ingress processing
+checks the value before tunnel forwarding. A packet with zero remaining
+hops is dropped; otherwise, the value is decreased by one and
+`myTunnel_exact` is applied. Checking zero first prevents subtraction
+from wrapping zero around to 255. The parser, deparser, sender and
+receiver will all use the same updated header format.
+
 
 ## 3. Implementation
 
-<!-- Summarise what you changed in tunnel.p4, send.py and receive.py. The pull request shows
-     the code itself: here, explain anything a reviewer might not see from the diff alone. -->
+I extended the P4 and Scapy tunnel formats with the same 8-bit
+`hop_limit` field. The ingress control drops a tunnelled packet when
+the value is zero; otherwise, it subtracts one before applying the
+tunnel table.
 
 ## 4. Evidence: it works
 
-<!-- Show, with your evidence files:
-     - tunnelled delivery to h2 and h3, and the hop limit the receivers saw (delivery.txt);
-     - plain IPv4 still works (delivery.txt);
-     - the same loop as in section 1 now ends, and after how many passes — does that match
-       your design? (loop-after.txt) -->
+
+The results in `evidence/delivery.txt` show that a tunnelled packet with
+destination 2 reached h2 and a packet with destination 3 reached h3.
+Both packets started with a hop limit of 8 and arrived with 6 because
+they were processed by s1 and s2. The same evidence file shows that a
+plain ping from h1 to h3 still succeeded, so the IPv4 forwarding path
+was not broken by the tunnel change.
+
+I recreated the original loop by changing s2's tunnel-destination-3
+entry to output port 1. In `evidence/loop-after.txt`, the first count
+showed 133 processing events on s1 and 132 on s2. The
+counts were unchanged five seconds later, showing that the packet had
+stopped circulating.
+
+The result matches my design. A starting limit of 8 permitted eight
+switch forwards. The packet then arrived at the next switch with zero
+remaining hops and was dropped. The final drop is also counted as a
+packet-processing event, so the total processing count can be one more
+than the number of successful forwards.
 
 ## 5. Evaluation
 
-<!-- a) The mixed rollout (mixed.txt): what did you predict before running s1 with your new
-        program and s2 with tunnel_v1.p4? What actually happened to delivery, and to the loop?
-        Explain every difference from your prediction, byte by byte if you need to.
-     b) Propose a safe way to roll out a header change across a network of switches that can't
-        all be upgraded at once. Compare at least two options (for example a version field, a
-        new EtherType, or ordering fields so old switches still parse them).
-     c) Loop protection in the data plane (this hop limit) versus the control plane (Week 3's
-        check_paths()): what can each catch that the other can't? Why do real networks use both?
-     d) What would this change cost on a hardware switch running at line rate? -->
+Before running the rollout, I predicted that s2 would correctly
+read `proto_id` and `dst_id` because the new field was appended after
+them. However, its old parser expects IPv4 to begin immediately after
+`dst_id`, so it would treat the new hop-limit byte as the first byte of
+the IPv4 header. 
+
+Before testing, I predicted that old `s2` would correctly read
+`proto_id` and `dst_id`, but would mistake the appended hop-limit byte
+for the start of IPv4. I also expected the mixed-version loop to stop,
+but more slowly because only new `s1` decreases the hop limit.
+
+The frame reached `h2`, but `receive.py` could not decode its UDP
+payload. The capture in `evidence/mixed.txt` contains
+`0800 0002 07 45`: the protocol ID, destination ID, remaining hop
+limit, and actual IPv4 start. Old `s2` parsed `07` as the first IPv4
+byte, shifting the header and causing checksum recomputation to change
+the real protocol value from UDP (`0x11`) to `0x0d`. This shows that
+preserving existing field positions is insufficient when the header
+length changes.
+
+### Safe rollout
+
+A safe rollout could use a new EtherType for the new header. Switches
+would first be upgraded to understand both formats while senders
+continued using the old one. After every transit switch was verified,
+senders could enable the new format and the old format could later be
+removed. This uses additional parser resources temporarily but avoids
+silently misparsing packets.
+
+Another option is a coordinated upgrade where all switches are updated
+before any sender uses the new header. This is simpler but requires more
+coordination and possibly a maintenance window. Adding a version field
+now would not fix compatibility because the existing old parser was not
+designed to read it.
+
+### Data plane versus control plane
+
+The hop limit provides data-plane containment for packets affected by
+runtime loops, stale entries or partial upgrades. It cannot prevent the
+configuration error, but limits its effect. Week 3's `check_paths()`
+provides control-plane prevention by finding loops and missing routes in
+the intended configuration before deployment. It cannot detect every
+difference between the model and the running switches. Real networks
+use both prevention and runtime containment.
+
+### Hardware cost
+
+The change adds one byte to each tunnelled packet. It also requires the
+parser and deparser to handle another field and ingress to perform a
+comparison, subtraction and conditional drop for every tunnelled
+packet. These operations consume fixed pipeline resources and could
+require another stage if the current stage is full. The design does not
+need per-flow state or another lookup table.
 
 ## AI use
 
