@@ -121,10 +121,19 @@ need per-flow state or another lookup table.
 
 ## AI use
 
-<!-- This assignment is Level 3 (Open): AI use is allowed if you declare it. State which tools you
-     used (or "None") and what each did — for example "ChatGPT explained the bmv2 log format;
-     the first draft of the hop-limit check came from Copilot, which I then changed and tested".
-     Be ready to explain any part of your work yourself. -->
+I used OpenAI Codex/ChatGPT throughout this assignment. It explained the
+C1–C6 requirements, helped interpret BMv2 table handles, switch logs and the
+mixed-version hexadecimal packet capture, and suggested the 8-bit hop-limit
+design with a default value of eight. It provided line-by-line suggestions for
+changes to `tunnel.p4`, `send.py` and `receive.py`, including the decrement/drop
+logic, the `--hops` option and receiver output. It also corrected indentation
+in `receive.py`, suggested commands for collecting the required evidence, and
+helped edit the report and pull-request description.
+
+I applied the changes in my repository, ran all Mininet and mixed-rollout
+experiments myself, checked the actual outputs, and revised the explanations
+to match my evidence. I can explain the submitted code, design decisions and
+test results.
 
 ## Evidence files
 
